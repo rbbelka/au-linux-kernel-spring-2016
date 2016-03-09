@@ -13,7 +13,7 @@ static void __init test_stack(void)
     stack_entry_t *tos = NULL;
     const char *tos_data = NULL;
     const char* test_data[] = { "1", "2", "3", "4" };
-    unsigned long i = 0;
+    long i = 0;
 
     pr_alert("Testing basic stack");
 
