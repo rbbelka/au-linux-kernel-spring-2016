@@ -34,9 +34,43 @@ static void __init test_stack(void)
     assert(stack_empty(&data_stack));
 }
 
-static void __init print_processes_backwards(void)
+static int __init print_processes_backwards(void)
 {
-    // TODO
+    int ret = 0;
+    stack_entry_t *tos = NULL;
+    char *buffer = NULL;
+    struct task_struct *task;
+    LIST_HEAD(processes);
+ 
+    for_each_process(task) {
+        char* buffer = (char *)kmalloc(sizeof(task->comm), GFP_KERNEL);
+	if(!buffer)
+	{
+	    ret = -ENOMEM;
+	    break;
+	}
+	
+	get_task_comm(buffer, task);	
+
+	tos = create_stack_entry((void*)buffer);
+ 	if(!tos)
+	{
+	    kfree(tos);
+	    ret = -ENOMEM;
+	    break;
+	}
+	
+        stack_push(&processes, tos);
+    }
+ 
+    while (!stack_empty(&processes)) {
+        tos = stack_pop(&processes);
+        buffer = STACK_ENTRY_DATA(tos, char*);
+        printk(KERN_ALERT "%s\n", buffer);
+	delete_stack_entry(tos); 
+ 	kfree(buffer);
+    }
+    return ret;
 }
 
 static int __init ll_init(void)
