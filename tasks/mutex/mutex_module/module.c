@@ -47,31 +47,198 @@ typedef struct mutex_dev {
 
 static mutex_dev_t *mutex_dev;
 
-// TODO implement all the missing
+// getting mstate by tgid
+#define lookup_tgroup_mutex_state(id)                                   \
+({                                                                      \
+    tgroup_mutex_state_t *mstate = NULL;                                \
+    hlist_for_each_entry(mstate, &mutex_dev->sysmstate.tgstates, hnode) \
+        if (mstate->tgid == (id))                                       \
+            break;                                                      \
+    mstate;                                                             \
+})
 
-#define lookup_tgroup_mutex_state(tgid) NULL
-#define lookup_mutex(tgroup_mstate, mid) NULL
-#define init_system_mutex_state(sysmstate) do{}while(0)
-#define deinit_system_mutex_state(sysmstate) do{}while(0)
+// getting mutex by id and mstate
+#define lookup_mutex(tgroup_mstate, mid)                                \
+({                                                                      \
+    tgroup_mutex_t *mutex = NULL;                                       \
+    hlist_for_each_entry(mutex, &(tgroup_mstate)->mlist, hnode)         \
+        if (mutex->id == (mid))                                         \
+            break;                                                      \
+    mutex;                                                              \
+})
+// should handle errors after calling lookup_tgroup_mutex_state() and lookup_mutex()
+
+#define init_system_mutex_state(sysmstate)                              \
+do {                                                                    \
+    spin_lock_init(&(sysmstate)->wlock);                                \
+    INIT_HLIST_HEAD(&(sysmstate)->tgstates);                            \
+} while (0)
+
+
+#define deinit_tgroup_mutex_state(tgstate)                              \
+do {                                                                    \
+    tgroup_mutex_t *mutex = NULL;                                       \
+    struct hlist_node *node = NULL;                                     \
+    struct hlist_node *tmp = NULL;                                      \
+                                                                        \
+    hlist_for_each_safe(node, tmp, &(tgstate)->mlist) {                 \
+        mutex = hlist_entry(node, tgroup_mutex_t, hnode);               \
+        hlist_del(&mutex->hnode);                                       \
+        wake_up_interruptible_all(&mutex->wqh);                         \
+        kfree(mutex);                                                   \
+    }                                                                   \
+    kfree((tgstate));                                                   \
+} while (0)
+
+
+#define deinit_system_mutex_state(sysmstate)                            \
+do {                                                                    \
+    struct hlist_head tgstates;                                         \
+    struct hlist_node *node = NULL;                                     \
+    struct hlist_node *tmp = NULL;                                      \
+    tgroup_mutex_state_t *tgstate = NULL;                               \
+                                                                        \
+    spin_lock(&(sysmstate)->wlock);                                     \
+    tgstates = (sysmstate)->tgstates;                                   \
+    INIT_HLIST_HEAD(&(sysmstate)->tgstates);                            \
+    spin_unlock(&(sysmstate)->wlock);                                   \
+                                                                        \
+    synchronize_rcu();                                                  \
+                                                                        \
+    hlist_for_each_safe(node, tmp, &(sysmstate)->tgstates) {            \
+        tgstate = hlist_entry(node, tgroup_mutex_state_t, hnode);       \
+        hlist_del(&tgstate->hnode);                                     \
+        deinit_tgroup_mutex_state(tgstate);                             \
+    }                                                                   \
+} while (0)
 
 static int mutex_dev_open(struct inode *inode, struct file *filp)
 {
-    return -EBUSY;
+    tgroup_mutex_state_t *tgstate = NULL;
+    tgroup_mutex_state_t *mstate = NULL;
+
+    tgstate = (tgroup_mutex_state_t *)kzalloc(sizeof(*tgstate), GFP_KERNEL);
+    if (!tgstate)
+        return -ENOMEM;
+
+    tgstate->tgid = current->tgid;
+    spin_lock_init(&tgstate->wlock);
+
+    tgstate->next_mid = 0;
+    INIT_HLIST_HEAD(&tgstate->mlist);
+
+    // changes under rcu lock
+    rcu_read_lock();
+    mstate = lookup_tgroup_mutex_state(current->tgid);
+    if (mstate) {
+        rcu_read_unlock();
+        kfree(tgstate);
+        return -EINVAL;
+    }
+
+    spin_lock(&mutex_dev->sysmstate.wlock);
+    hlist_add_head(&tgstate->hnode, &mutex_dev->sysmstate.tgstates);
+    spin_unlock(&mutex_dev->sysmstate.wlock);
+    rcu_read_unlock();
+
+    return 0;
 }
 
 static int mutex_dev_release(struct inode *inode, struct file *filp)
 {
-    return -EBUSY;
+    tgroup_mutex_state_t *mstate = NULL;
+
+    // changes under rcu lock
+    rcu_read_lock();
+    mstate = lookup_tgroup_mutex_state(current->tgid);
+    if (!mstate) {
+        rcu_read_unlock();
+        return -EINVAL;
+    }
+
+    spin_lock(&mutex_dev->sysmstate.wlock);
+    hlist_del(&mstate->hnode);
+    spin_unlock(&mutex_dev->sysmstate.wlock);
+    rcu_read_unlock();
+
+    synchronize_rcu();
+    deinit_tgroup_mutex_state(mstate);
+
+    return 0;
 }
 
 static long mutex_ioctl_lock_create(mutex_ioctl_lock_create_arg_t __user *uarg)
 {
-    return -EBUSY;
+    tgroup_mutex_state_t *mstate = NULL;
+    tgroup_mutex_t *mutex = NULL;
+    mutex_ioctl_lock_create_arg_t arg;
+
+    mutex = (tgroup_mutex_t *) kzalloc(sizeof(*mutex), GFP_KERNEL);
+    if (!mutex)
+      return -ENOMEM;
+
+    spin_lock_init(&mutex->wlock);
+    init_waitqueue_head(&mutex->wqh);
+
+    rcu_read_lock();
+    mstate = lookup_tgroup_mutex_state(current->tgid);
+    if (!mstate) {
+      rcu_read_unlock();
+      kfree(mutex);
+      return  -EINVAL;
+    }
+
+    // passing arg to userspace
+    mutex->id = __sync_fetch_and_add(&mstate->next_mid, 1);
+    arg.id = mutex->id;
+    if (copy_to_user(uarg, &arg, sizeof(arg))) {
+      rcu_read_unlock();
+      kfree(mutex);
+      return -EFAULT;
+    }
+
+    spin_lock(&mstate->wlock);
+    hlist_add_head(&mutex->hnode, &mstate->mlist);
+    spin_unlock(&mstate->wlock);
+    rcu_read_unlock();
+
+    return 0;
 }
 
 static long mutex_ioctl_lock_destroy(mutex_ioctl_lock_destroy_arg_t __user *uarg)
 {
-    return -EBUSY;
+    tgroup_mutex_state_t *mstate = NULL;
+    tgroup_mutex_t *mutex = NULL;
+    mutex_ioctl_lock_destroy_arg_t arg;
+
+    // getting arg from userspace
+    if (copy_from_user(&arg, uarg, sizeof(arg)))
+        return -EFAULT;
+
+    rcu_read_lock();
+    mstate = lookup_tgroup_mutex_state(current->tgid);
+    if (!mstate) {
+        rcu_read_unlock();
+        return -EINVAL;
+    }
+
+    mutex = lookup_mutex(mstate, arg.id);
+    if (!mutex) {
+        rcu_read_unlock();
+        return -EINVAL;
+    }
+
+    spin_lock(&mstate->wlock);
+    hlist_del(&mutex->hnode);
+    spin_unlock(&mstate->wlock);
+    rcu_read_unlock();
+
+    synchronize_rcu();
+
+    wake_up_interruptible_all(&mutex->wqh);
+    kfree(mutex);
+
+    return 0;
 }
 
 static long mutex_queue_wait(shared_spinlock_t *spinlock, mutex_id_t mid)
@@ -132,18 +299,35 @@ static long mutex_queue_wait(shared_spinlock_t *spinlock, mutex_id_t mid)
 
 static long mutex_ioctl_lock_wait(mutex_ioctl_lock_wait_arg_t *uarg)
 {
-    // Note: to perform cross kernel-userspace CAS
-    // your code can work with userspace addresses directly.
-    // This is needed for simplification.
-    return -EBUSY;
+    long ret = 0;
+    while (!shared_spin_trylock(uarg->spinlock)) {
+        ret = mutex_queue_wait(uarg->spinlock, uarg->id);
+        if (ret)
+            return ret;
+    }
+    return ret;
 }
 
 static long mutex_ioctl_lock_wake(mutex_ioctl_lock_wake_arg_t *uarg)
 {
-    // Note: to perform cross kernel-userspace CAS
-    // your code can work with userspace addresses directly.
-    // This is needed for simplification.
-    return -EBUSY;
+    tgroup_mutex_state_t *mstate = NULL;
+    tgroup_mutex_t *mutex = NULL;
+
+    rcu_read_lock();
+    mstate = lookup_tgroup_mutex_state(current->tgid);
+    if (!mstate)
+        return -EINVAL;
+
+    mutex = lookup_mutex(mstate, uarg->id);
+    if (!mutex)
+        return -EINVAL;
+
+    shared_spin_unlock(uarg->spinlock);
+    wake_up_interruptible(&mutex->wqh);
+
+    rcu_read_unlock();
+
+    return 0;
 }
 
 static long mutex_dev_ioctl(struct file *filp, unsigned int cmd,
